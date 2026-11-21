@@ -1,6 +1,6 @@
 # Insta360 ARM64 Pipeline
 
-Experimental Windows on Arm command-line converter for two synchronized, square-cropped fisheye views. It produces a mono 2:1 equirectangular HEVC MP4 with Spherical Video V2 metadata. A separate tool reads built-in motion data. The converter applies externally prepared spherical rotation corrections during projection. Fitting an X6 stitch and deriving those rotations automatically remain open.
+Experimental Windows on Arm command-line converter for two synchronized, square-cropped fisheye views. It produces a mono 2:1 equirectangular HEVC MP4 with Spherical Video V2 metadata. It supports factory-calibrated X6 projection, overlap blending and automatic rotational stabilization using the camera's motion data.
 
 ## Setup
 
@@ -13,6 +13,24 @@ python insta360_arm.py --require-arm64 encode-test test.mp4 --size 1920x960 --bi
 ```
 
 `doctor` inspects the PE machine type of both FFmpeg tools and prints the options exposed by the build. Seeing `hevc_mf` in that output only confirms the wrapper is compiled in.
+
+## Windows desktop app
+
+Double-click `Launch Insta360 Converter.cmd` or run `python insta360_gui.py`. Choose a source and MP4 destination, then select the CPU or Qualcomm hardware encoder. Resolution, frame rate, bit depth, target bitrate and preview length are available on the Convert tab. The bitrate slider and numeric field use Mb/s. Hardware encoding selects 8-bit and requires a target bitrate.
+
+Use Advanced for separate stream indices, lens geometry, a rotation correction CSV, or the path to `ffmpeg.exe` if FFmpeg is not found. Keep the matching `ffprobe.exe` beside it. Apply stabilization is checked by default. It uses the built-in IMU on factory-calibrated X6 exports, or the rotation CSV if you supply one. Uncheck it to export without stabilization. Use Cancel to stop an export or Open output folder after verification.
+
+## Factory-calibrated X6 stitch
+
+The desktop app enables **Factory calibration and seam blending (X6)** by default for single-file INSV sources. It requires NumPy and the native telemetry executable. Build the executable as shown below or supply its location on the command line with `--telemetry-tool`.
+
+```powershell
+python -m pip install numpy
+cargo build --locked --release --manifest-path telemetry/Cargo.toml
+python insta360_arm.py --require-arm64 convert clip.insv calibrated.mp4 --calibrated --seconds 5
+```
+
+This path reads both lens models from the recording and feathers their overlap. It uses fixed CPU maps and nearest-neighbor lens sampling. It does not compensate for nearby parallax, per-lens exposure differences, or rolling shutter. At 8K, it needs several hundred MB of temporary map files alongside the destination and can take more memory and time than the ideal-lens mode. Uncheck the option to use the earlier projection or to use manual lens geometry settings.
 
 ## Inspect and convert
 
@@ -39,13 +57,19 @@ Audio from the first input is copied if present and must be MP4-compatible. The 
 
 ## Apply rotation corrections
 
+For automatic X6 stabilization, add `--auto-stabilize` to a `--calibrated` export. The extractor reads the sensor samples in the first lens's coordinate frame. The estimator integrates gyro rotation, gently aligns up with gravity using the accelerometer, and smooths heading. It applies one correction per source frame before any output frame-rate change. It uses the parser's timestamps and supports `--imu-offset-ms` for a measured sync correction. A positive offset uses a later sensor sample for each frame. Keep the default zero unless you have measured an offset.
+
+Automatic stabilization requires timestamped X6 IMU data and constant-rate footage. The desktop app defaults to Vulkan for the rotation pass, which was verified on the Zenbook's Adreno GPU with the bundled build. Choose `cpu` in Advanced if your GPU or FFmpeg build lacks Vulkan projection. The CLI defaults to CPU and accepts `--stabilization-device vulkan` to use the GPU. The CPU pass is expensive at 8K. Stabilization corrects camera orientation. Camera translation, rolling shutter and absolute heading drift remain outside the current estimator.
+
+To use externally derived corrections instead, pass a CSV with this format:
+
 ```csv
 time_s,yaw_deg,pitch_deg,roll_deg
 0,0,0,0
 0.033333,0.2,-0.1,0.5
 ```
 
-Pass this file using `--motion rotations.csv`. Times are seconds from the normalized video timeline and must increase from zero. Angles are absolute corrections in FFmpeg v360 yaw, pitch, roll composition order. Each row takes effect at the first eligible frame and is held until the next row. Supply a synchronized per-frame correction sequence for smooth motion. The converter applies the rotations to the full sphere in the same sampling step as the lens projection. Dynamic updates rebuild the CPU remap and can be much slower than a static stitch. These rotations can address orientation changes. Camera translation, nearby parallax, motion blur and rolling shutter require other techniques.
+Pass this file using `--motion rotations.csv`. Times are seconds from the normalized video timeline and must increase from zero. Angles are absolute corrections in FFmpeg v360 yaw, pitch, roll composition order. Each row takes effect at the first eligible frame and is held until the next row. Supply a synchronized per-frame correction sequence for smooth motion. The ideal-lens path combines rotation and projection in one sampling step. The calibrated path rotates the blended sphere in a second pass. Dynamic updates rebuild the CPU rotation map and can be much slower than a static stitch. These rotations address orientation changes. Camera translation, nearby parallax, motion blur and rolling shutter require other techniques.
 
 ### Extract camera motion and rig data
 

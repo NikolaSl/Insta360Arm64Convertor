@@ -23,3 +23,13 @@ Single short runs on Snapdragon X2E-88-100, Windows 11 26H1 build 28000.3501, na
 | Original X6, CPU projection + x265 ultrafast, CRF 18 | 7680×3840 at 30000/1001 fps, 10-bit | 1.001 | 5.166 | 0.19× |
 
 The real-video rows used static ideal-lens geometry and the same recording. Estimating sustained speed or comparing encoder efficiency requires a longer like-for-like test. FFmpeg reported about 3.8 GiB, 5.2 GiB and 10.6 GiB peak working set for the three camera runs in table order.
+
+## Factory-calibrated stitching smoke test
+
+On a two-second excerpt of the same X6 source, 7680×3840 at 30000/1001 fps with 8-bit Qualcomm HEVC and a 120 Mb/s target, the ideal-lens path took 2.98 seconds. The calibrated path took 6.49 seconds, including map generation. FFmpeg peak working sets were approximately 5.2 and 6.8 GiB respectively. The calibrated path builds fixed maps once per export, so the short test overstates the per-frame cost of map generation. A sustained comparison still needs longer runs.
+
+## Automatic stabilization smoke test
+
+At the same 8K settings, a two-second stabilized export using Adreno Vulkan rotation and Qualcomm hardware encoding took 8.76 seconds, including map generation. Logs identified both hardware paths and the resulting 60-frame MP4 decoded successfully. The lenses are still decoded and stitched on the CPU.
+
+On an eight-second 960×480 excerpt with the same calibrated projection, median tracked displacement across nine background patches over four-frame intervals was 0.80 pixels with stabilization off, 0.53 pixels with CPU stabilization and 0.50 pixels with Vulkan stabilization. This is one footage comparison, with no independent timing reference. It does not establish performance for rapid motion, walking or other capture modes.

@@ -12,14 +12,20 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import time
+
+from calibrated_stitch import camera_indices, prepare_maps
+from motion_stabilization import estimate_rotations, product, scaled_axis, unit
 
 
 def run(args, capture=False, cwd=None):
     return subprocess.run(
         args, check=True, text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE if capture else None, cwd=cwd,
+        creationflags=(subprocess.CREATE_NO_WINDOW
+                       if os.name == "nt" and Path(sys.executable).stem == "pythonw" else 0),
     ).stdout
 
 
@@ -93,6 +99,19 @@ def crop(text, stream):
     return values
 
 
+def rotation_commands(t, yaw, pitch, roll, vulkan=False):
+    target = "v360_vulkan@stitch" if vulkan else "v360@stitch"
+    commands = [] if vulkan else [f"{target} reset_rot -1"]
+    # This Vulkan shader reads the matrix transposed. Reverse the order and
+    # negate the angles so it samples the same directions as the CPU filter.
+    if vulkan:
+        yaw, pitch, roll = -yaw, -pitch, -roll
+    commands.extend(f"{target} {axis} {angle:.9f}"
+                    for axis, angle in zip(("yaw", "pitch", "roll"), (yaw, pitch, roll))
+                    if vulkan or angle != 0)
+    return f"{t:.9f} {', '.join(commands)};\n"
+
+
 def corrections(path):
     lines = []
     previous = -1
@@ -107,15 +126,11 @@ def corrections(path):
                     or max(abs(yaw), abs(pitch), abs(roll)) > 180
                     or (lines and f"{t:.9f}" == f"{previous:.9f}")):
                 raise ValueError("Motion requires finite angles in [-180,180] and increasing times from zero")
-            commands = ["v360@stitch reset_rot -1"]
-            commands.extend(f"v360@stitch {axis} {angle:.9f}"
-                            for axis, angle in zip(("yaw", "pitch", "roll"), (yaw, pitch, roll))
-                            if angle != 0)
-            lines.append(f"{t:.9f} {', '.join(commands)};")
+            lines.append(rotation_commands(t, yaw, pitch, roll))
             previous = t
     if not lines:
         raise ValueError("Motion CSV is empty")
-    return "\n".join(lines) + "\n"
+    return "".join(lines)
 
 
 def encoder_args(encoder, bits, bitrate, crf, preset):
@@ -199,7 +214,8 @@ def tag_spherical(path):
     raise ValueError("Missing MP4 moov atom")
 
 
-def encode(ffmpeg, ffprobe, args, output, bits, width, height, motion=None):
+def encode(ffmpeg, ffprobe, args, output, bits, width, height, motion=None, runner=run,
+           prepare=None):
     output = output.resolve()
     if output.suffix.lower() != ".mp4" or output.exists() or not output.parent.is_dir():
         raise ValueError("Output must be a new .mp4 in an existing directory")
@@ -209,8 +225,10 @@ def encode(ffmpeg, ffprobe, args, output, bits, width, height, motion=None):
         if motion:
             (work / "motion.cmd").write_text(corrections(motion), encoding="ascii")
         started = time.perf_counter()
-        run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "verbose", "-benchmark",
-             *args, "-tag:v", "hvc1", str(candidate)], cwd=work)
+        if prepare:
+            prepare(work)
+        runner([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "verbose", "-benchmark",
+                *args, "-tag:v", "hvc1", str(candidate)], cwd=work)
         tag_spherical(candidate)
         [stream] = videos(probe(ffprobe, candidate))
         spherical = any(s.get("projection") == "equirectangular"
@@ -233,7 +251,54 @@ COLOR_FIELDS = {"color_range": "color_range", "color_space": "colorspace",
                 "color_transfer": "color_trc", "color_primaries": "color_primaries"}
 
 
-def convert(args, ffmpeg, ffprobe):
+def read_calibration(path, tool, motion):
+    folder = Path(__file__).resolve().parent / "telemetry" / "target"
+    candidates = [folder / mode / "insta360-telemetry.exe" for mode in ("release", "debug")]
+    tool = tool or next((str(p) for p in candidates if p.is_file()), "insta360-telemetry")
+    mode = "--lens-imu" if motion else "--rig-only"
+    data = json.loads(run([executable(tool), mode, str(path)], capture=True))
+    if data["camera_model"] != "Insta360 X6" or not data["rig"]:
+        raise ValueError("Calibrated stitching requires a supported X6 recording")
+    return data
+
+
+def automatic_commands(data, stream, fps, seconds, offset_ms, vulkan=False):
+    if not data["accurate_timestamps"] or rate(stream["r_frame_rate"]) != fps:
+        raise ValueError("Automatic stabilization needs timestamped IMU and constant frame rate")
+    count = int(stream["nb_frames"])
+    if seconds is not None:
+        count = min(count, math.ceil(seconds * fps))
+    if count <= 0:
+        raise ValueError("Automatic stabilization needs the source frame count")
+    projection = data["rig"]["projection"]
+    lens0 = projection["kind"]["Rig"]["cameras"][0]["rotation"]
+    lens_rotation = unit(tuple(lens0[k] for k in "wxyz"))
+    # The parser's X6 lens-oriented IMU still uses its sideways optical basis.
+    # Image feature motion on the X6 confirms (-z, y, x) before the lens residual.
+    lens_to_rig = product(lens_rotation, scaled_axis((0, 1, 0), -math.pi/2))
+    # FFmpeg rounds timeline comparisons to microseconds. Place each command
+    # between frame timestamps so rounding cannot delay it by a frame.
+    return "".join(rotation_commands(float(max(0, frame - 0.25) / fps), *angles, vulkan=vulkan)
+                   for frame, angles in estimate_rotations(
+                       data.pop("imu"), lens_to_rig, fps, count - 1, offset_ms))
+
+
+def calibrated_graph(rig, width, height, bits, color_range):
+    indices = camera_indices(rig)
+    pixel = "yuv444p10le" if bits == 10 else "yuv444p"
+    inputs = []
+    for name in ("lens0-x", "lens0-y", "lens1-x", "lens1-y", "mask444"):
+        inputs += ["-f", "rawvideo", "-pixel_format", pixel if name == "mask444" else "gray16le",
+                   "-video_size", f"{width}x{height}", "-i", f"{name}.raw"]
+    source_range = f"scale=in_range={color_range}:out_range={color_range}," if color_range else ""
+    graph = [
+        f"[0:{index}]{source_range}format={pixel},setsar=1[cal{i}];"
+        f"[cal{i}][{1+2*i}:v][{2+2*i}:v]remap[l{i}]"
+        for i, index in enumerate(indices)]
+    return inputs, graph, "[l0][l1][5:v]maskedmerge"
+
+
+def convert(args, ffmpeg, ffprobe, runner=run):
     paths = [Path(args.input).resolve(strict=True)]
     if args.right:
         paths.append(Path(args.right).resolve(strict=True))
@@ -263,6 +328,12 @@ def convert(args, ffmpeg, ffprobe):
     if all("duration" in s for s in (left, right)):
         if abs(Fraction(left["duration"]) - Fraction(right["duration"])) > 1 / rates[0]:
             raise ValueError("Lens durations differ by more than one frame")
+    if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
+        raise ValueError("Preview duration must be positive")
+    if args.auto_stabilize and not args.calibrated:
+        raise ValueError("Automatic stabilization requires factory-calibrated X6 stitching")
+    if not math.isfinite(args.imu_offset_ms):
+        raise ValueError("IMU offset must be finite")
     w, h = args.size or (left_crop[0] * 2, left_crop[0])
     if h < 2 or h % 2 or w != 2 * h:
         raise ValueError("Output must be 2:1 with even dimensions")
@@ -281,28 +352,51 @@ def convert(args, ffmpeg, ffprobe):
                     3: ["transpose=cclock"]}[turns]
         graph.append(f"[{min(i, len(paths)-1)}:{stream['index']}]{','.join(filters)}[l{i}]")
     order = "[l1][l0]" if args.swap else "[l0][l1]"
-    motion = "sendcmd=f=motion.cmd," if args.motion else ""
+    motion = "sendcmd=f=motion.cmd," if args.motion or args.auto_stabilize else ""
     cadence = f",fps={args.fps}" if args.fps else ""
     rng = color(left, "color_range")
     range_filter = f",scale=in_range={rng}:out_range={rng}" if rng in {"pc", "tv"} else ""
-    graph.append(f"{order}hstack=shortest=1,{motion}v360@stitch=dfisheye:equirect:"
-                 f"w={w}:h={h}:ih_fov={args.fov}:iv_fov={args.fov}:interp={args.interp}"
-                 f"{cadence}{range_filter},format={target}[sphere]")
     cmd = []
     for path in paths:
         cmd += ["-noautorotate", "-i", str(path)]
+    prepare = None
+    if args.calibrated:
+        if args.right or args.left_crop or args.right_crop or args.left_turns or args.right_turns or args.swap:
+            raise ValueError("Factory calibration requires both original tracks and their unmodified geometry")
+        calibration = read_calibration(paths[0], args.telemetry_tool, args.auto_stabilize)
+        rig = calibration["rig"]
+        extra_inputs, graph, project = calibrated_graph(rig, w, h, source_bits,
+                                                       rng if rng in {"pc", "tv"} else None)
+        cmd += extra_inputs
+        vulkan = args.auto_stabilize and args.stabilization_device == "vulkan"
+        if vulkan:
+            cmd[:0] = ["-init_hw_device", "vulkan=stabilizer:0", "-filter_hw_device", "stabilizer"]
+            upload = "yuv420p10le" if source_bits == 10 else "yuv420p"
+            project += (f",{motion}format={upload},hwupload,"
+                        f"v360_vulkan@stitch=equirect:equirect:rorder=rpy,hwdownload,format={upload}")
+        elif motion:
+            project += f",{motion}v360@stitch=equirect:equirect:interp={args.interp}"
+
+        def prepare(folder):
+            if args.auto_stabilize:
+                commands = automatic_commands(calibration, left, rates[0], args.seconds,
+                                              args.imu_offset_ms, vulkan)
+                (folder / "motion.cmd").write_text(commands, encoding="ascii")
+            prepare_maps(folder, rig, (left, right), w, h, source_bits)
+    else:
+        project = (f"{order}hstack=shortest=1,{motion}v360@stitch=dfisheye:equirect:"
+                   f"w={w}:h={h}:ih_fov={args.fov}:iv_fov={args.fov}:interp={args.interp}")
+    graph.append(f"{project}{cadence}{range_filter},format={target}[sphere]")
     cmd += ["-filter_complex", ";".join(graph), "-map", "[sphere]", "-map", "0:a:0?",
             "-map_metadata", "-1", "-map_chapters", "-1", "-c:a", "copy",
             "-fps_mode", "passthrough", *enc]
     if args.seconds is not None:
-        if not math.isfinite(args.seconds) or args.seconds <= 0:
-            raise ValueError("Preview duration must be positive")
         cmd += ["-t", str(args.seconds)]
     for field, flag in COLOR_FIELDS.items():
         value = color(left, field)
         if value and value not in {"unknown", "unspecified", "reserved"}:
             cmd += [f"-{flag}", value]
-    encode(ffmpeg, ffprobe, cmd, Path(args.output), bits, w, h, args.motion)
+    encode(ffmpeg, ffprobe, cmd, Path(args.output), bits, w, h, args.motion, runner, prepare)
 
 
 def size(value):
@@ -310,8 +404,8 @@ def size(value):
     return w, h
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(parser_class=argparse.ArgumentParser):
+    parser = parser_class(description=__doc__)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--require-arm64", action="store_true")
@@ -331,7 +425,13 @@ def main():
     convert_parser.add_argument("--fov", type=float, default=180)
     convert_parser.add_argument("--interp", choices=("near", "line", "cube"), default="line")
     convert_parser.add_argument("--fps", type=lambda x: str(rate(x)))
-    convert_parser.add_argument("--motion", type=Path)
+    stabilization = convert_parser.add_mutually_exclusive_group()
+    stabilization.add_argument("--motion", type=Path)
+    stabilization.add_argument("--auto-stabilize", action="store_true")
+    convert_parser.add_argument("--imu-offset-ms", type=float, default=0.0)
+    convert_parser.add_argument("--stabilization-device", choices=("cpu", "vulkan"), default="cpu")
+    convert_parser.add_argument("--calibrated", action="store_true")
+    convert_parser.add_argument("--telemetry-tool", help="Path to the native telemetry executable")
     convert_parser.add_argument("--seconds", type=float, help="Limit output to a short preview")
     for command in (convert_parser, sub.add_parser("encode-test")):
         command.add_argument("--size", type=size)
@@ -346,6 +446,11 @@ def main():
     test.add_argument("output")
     test.add_argument("--fps", type=lambda x: str(rate(x)), default="30")
     test.add_argument("--seconds", type=float, default=2)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     try:
         ffprobe = executable(args.ffprobe)
