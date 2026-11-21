@@ -1,0 +1,383 @@
+"""Experimental dual-fisheye conversion using a native FFmpeg executable."""
+
+import argparse
+import csv
+from fractions import Fraction
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import time
+
+
+def run(args, capture=False, cwd=None):
+    return subprocess.run(
+        args, check=True, text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE if capture else None, cwd=cwd,
+    ).stdout
+
+
+def probe(exe, path):
+    return json.loads(run([exe, "-v", "error", "-show_streams", "-show_format",
+                           "-of", "json", str(path)], capture=True))
+
+
+def machine(exe):
+    with open(exe, "rb") as f:
+        if f.read(2) != b"MZ":
+            return "non-PE"
+        f.seek(60)
+        offset, = struct.unpack("<I", f.read(4))
+        f.seek(offset)
+        if f.read(4) != b"PE\0\0":
+            raise ValueError("Invalid PE signature")
+        code, = struct.unpack("<H", f.read(2))
+    return {0xAA64: "ARM64", 0x8664: "x64", 0x14C: "x86"}.get(code, hex(code))
+
+
+def executable(name):
+    location = shutil.which(name)
+    if not location:
+        raise ValueError(f"Cannot find {name}. Add FFmpeg to PATH or supply its full path.")
+    return str(Path(location).resolve())
+
+
+def rate(value):
+    result = Fraction(value)
+    if not 0 < result <= 1000:
+        raise ValueError("FPS must be positive and at most 1000")
+    return result
+
+
+def depth(stream):
+    fmt = stream.get("pix_fmt", "")
+    if fmt in {"yuv420p", "yuvj420p", "nv12"}:
+        return 8
+    if fmt in {"yuv420p10le", "p010le"}:
+        return 10
+    raise ValueError(f"Unsupported source pixel format {fmt!r}. Expected 8- or 10-bit 4:2:0.")
+
+
+def videos(info):
+    return [s for s in info["streams"] if s["codec_type"] == "video"
+            and not s.get("disposition", {}).get("attached_pic")]
+
+
+def choose(info, index):
+    candidates = videos(info)
+    if index is None and len(candidates) == 1:
+        return candidates[0]
+    for stream in candidates:
+        if stream["index"] == index:
+            return stream
+    raise ValueError(f"Select an absolute video stream index from {[s['index'] for s in candidates]}")
+
+
+def crop(text, stream):
+    if text is None:
+        values = (stream["width"], stream["height"], 0, 0)
+    else:
+        values = tuple(map(int, text.split(":")))
+    if len(values) != 4:
+        raise ValueError("Crop must be SIZE:SIZE:X:Y")
+    w, h, x, y = values
+    if (w != h or w <= 0 or min(x, y) < 0 or any(n % 2 for n in values)
+            or x + w > stream["width"] or y + h > stream["height"]):
+        raise ValueError("Each lens requires an even, square crop inside its stream")
+    return values
+
+
+def corrections(path):
+    lines = []
+    previous = -1
+    with open(path, newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames != ["time_s", "yaw_deg", "pitch_deg", "roll_deg"]:
+            raise ValueError("Motion CSV header must be time_s,yaw_deg,pitch_deg,roll_deg")
+        for row in reader:
+            t, yaw, pitch, roll = (float(row[k]) for k in reader.fieldnames)
+            if (not all(math.isfinite(v) for v in (t, yaw, pitch, roll))
+                    or t < 0 or t <= previous or (not lines and t != 0)
+                    or max(abs(yaw), abs(pitch), abs(roll)) > 180
+                    or (lines and f"{t:.9f}" == f"{previous:.9f}")):
+                raise ValueError("Motion requires finite angles in [-180,180] and increasing times from zero")
+            commands = ["v360@stitch reset_rot -1"]
+            commands.extend(f"v360@stitch {axis} {angle:.9f}"
+                            for axis, angle in zip(("yaw", "pitch", "roll"), (yaw, pitch, roll))
+                            if angle != 0)
+            lines.append(f"{t:.9f} {', '.join(commands)};")
+            previous = t
+    if not lines:
+        raise ValueError("Motion CSV is empty")
+    return "\n".join(lines) + "\n"
+
+
+def encoder_args(encoder, bits, bitrate, crf, preset):
+    if bitrate and not re.fullmatch(r"[1-9][0-9]*[kKmM]?", bitrate):
+        raise ValueError("Bitrate must be positive, optionally suffixed with k or M")
+    if encoder == "mf":
+        if bits != 8:
+            raise ValueError("The FFmpeg Media Foundation path in this MVP supports only 8-bit NV12")
+        if not bitrate:
+            raise ValueError("Media Foundation requires an explicit --bitrate")
+        return ["-c:v", "hevc_mf", "-hw_encoding", "1", "-pix_fmt", "nv12", "-b:v", bitrate]
+    args = ["-c:v", "libx265", "-preset", preset,
+            "-pix_fmt", "yuv420p10le" if bits == 10 else "yuv420p"]
+    return args + (["-b:v", bitrate] if bitrate else ["-crf", str(crf)])
+
+
+def box(kind, payload):
+    return struct.pack(">I4s", len(payload) + 8, kind) + payload
+
+
+def boxes(data):
+    pos = 0
+    while pos < len(data):
+        if len(data) - pos < 8:
+            raise ValueError("Truncated MP4 box")
+        size, kind = struct.unpack_from(">I4s", data, pos)
+        if not 8 <= size <= len(data) - pos:
+            raise ValueError("Unsupported or damaged nested MP4 box")
+        yield kind, data[pos + 8:pos + size]
+        pos += size
+
+
+def tag_spherical(path):
+    """Insert Spherical Video V2 into FFmpeg's final moov; mdat offsets stay fixed."""
+    zeros = bytes(4)
+    spherical = box(b"sv3d", box(b"svhd", zeros + b"Insta360 ARM MVP\0") +
+                    box(b"proj", box(b"prhd", bytes(16)) + box(b"equi", bytes(20))))
+    count = 0
+
+    def update(data, level=0):
+        nonlocal count
+        chain = (b"trak", b"mdia", b"minf", b"stbl", b"stsd")
+        if level == len(chain):
+            prefix = data[:8]
+            entries = []
+            for kind, payload in boxes(data[8:]):
+                if kind in {b"hvc1", b"hev1"}:
+                    if len(payload) < 78:
+                        raise ValueError("Truncated HEVC visual sample entry")
+                    children = b"".join(box(k, p) for k, p in boxes(payload[78:])
+                                        if k not in {b"sv3d", b"st3d"})
+                    payload = payload[:78] + children + box(b"st3d", bytes(5)) + spherical
+                    count += 1
+                entries.append(box(kind, payload))
+            return prefix + b"".join(entries)
+        return b"".join(box(k, update(p, level + 1) if k == chain[level] else p)
+                        for k, p in boxes(data))
+
+    end = path.stat().st_size
+    with path.open("r+b") as f:
+        while f.tell() < end:
+            start = f.tell()
+            size, kind = struct.unpack(">I4s", f.read(8))
+            header = 8
+            if size == 1:
+                size, = struct.unpack(">Q", f.read(8))
+                header = 16
+            if not header <= size <= end - start:
+                raise ValueError("Invalid top-level MP4 box")
+            if kind == b"moov":
+                if start + size != end:
+                    raise ValueError("Expected FFmpeg's final moov atom")
+                result = update(f.read(size - header))
+                if count != 1:
+                    raise ValueError("Expected one HEVC sample entry")
+                f.seek(start)
+                f.write(box(b"moov", result))
+                f.truncate()
+                return
+            f.seek(start + size)
+    raise ValueError("Missing MP4 moov atom")
+
+
+def encode(ffmpeg, ffprobe, args, output, bits, width, height, motion=None):
+    output = output.resolve()
+    if output.suffix.lower() != ".mp4" or output.exists() or not output.parent.is_dir():
+        raise ValueError("Output must be a new .mp4 in an existing directory")
+    with tempfile.TemporaryDirectory(prefix=".insta360-", dir=output.parent) as temp:
+        work = Path(temp)
+        candidate = work / "output.mp4"
+        if motion:
+            (work / "motion.cmd").write_text(corrections(motion), encoding="ascii")
+        started = time.perf_counter()
+        run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "verbose", "-benchmark",
+             *args, "-tag:v", "hvc1", str(candidate)], cwd=work)
+        tag_spherical(candidate)
+        [stream] = videos(probe(ffprobe, candidate))
+        spherical = any(s.get("projection") == "equirectangular"
+                        for s in stream.get("side_data_list", []))
+        if (stream.get("codec_name") != "hevc" or depth(stream) != bits
+                or (stream["width"], stream["height"]) != (width, height) or not spherical):
+            raise ValueError("Encoded video failed codec, dimensions, depth, or 360 metadata verification")
+        # Publish atomically without replacing any output created by another process.
+        if os.name == "nt":
+            candidate.rename(output)
+        else:
+            os.link(candidate, output)
+        elapsed = time.perf_counter() - started
+        duration = float(stream.get("duration", 0))
+        print(json.dumps({"output": str(output), "seconds": round(elapsed, 3),
+                          "video_seconds": duration, "realtime_factor": duration / elapsed}))
+
+
+COLOR_FIELDS = {"color_range": "color_range", "color_space": "colorspace",
+                "color_transfer": "color_trc", "color_primaries": "color_primaries"}
+
+
+def convert(args, ffmpeg, ffprobe):
+    paths = [Path(args.input).resolve(strict=True)]
+    if args.right:
+        paths.append(Path(args.right).resolve(strict=True))
+    infos = [probe(ffprobe, path) for path in paths]
+    if len(paths) == 1 and len(videos(infos[0])) == 2:
+        default_left, default_right = (v["index"] for v in videos(infos[0]))
+    else:
+        default_left = default_right = None
+    left = choose(infos[0], args.left_stream if args.left_stream is not None else default_left)
+    right = choose(infos[-1], args.right_stream if args.right_stream is not None else default_right)
+    if len(paths) == 1 and left["index"] == right["index"]:
+        raise ValueError("Input must contain two distinct lens tracks or use --right")
+    left_crop, right_crop = crop(args.left_crop, left), crop(args.right_crop, right)
+    source_bits = depth(left)
+    if left_crop[0] != right_crop[0] or source_bits != depth(right):
+        raise ValueError("The two crops must have the same size and bit depth")
+
+    def color(stream, key):
+        return stream.get(key) or ("pc" if key == "color_range" and stream["pix_fmt"] == "yuvj420p" else None)
+
+    if any(color(left, k) != color(right, k) for k in COLOR_FIELDS):
+        raise ValueError("Lens color declarations differ")
+    start_times = [Fraction(s["start_time"]) for s in (left, right)]
+    rates = [rate(s["avg_frame_rate"]) for s in (left, right)]
+    if rates[0] != rates[1] or abs(start_times[0] - start_times[1]) >= 1 / (2 * rates[0]):
+        raise ValueError("Lens rates or start times differ. Align the sources before converting.")
+    if all("duration" in s for s in (left, right)):
+        if abs(Fraction(left["duration"]) - Fraction(right["duration"])) > 1 / rates[0]:
+            raise ValueError("Lens durations differ by more than one frame")
+    w, h = args.size or (left_crop[0] * 2, left_crop[0])
+    if h < 2 or h % 2 or w != 2 * h:
+        raise ValueError("Output must be 2:1 with even dimensions")
+    if not 180 <= args.fov <= 360:
+        raise ValueError("FOV must be between 180 and 360 degrees")
+    bits = args.bits or source_bits
+    enc = encoder_args(args.encoder, bits, args.bitrate, args.crf, args.preset)
+    intermediate = "yuv420p10le" if source_bits == 10 else (
+        "yuvj420p" if color(left, "color_range") == "pc" else "yuv420p")
+    target = "nv12" if args.encoder == "mf" else ("yuv420p10le" if bits == 10 else "yuv420p")
+    graph = []
+    for i, (stream, geometry, turns) in enumerate(
+            ((left, left_crop, args.left_turns), (right, right_crop, args.right_turns))):
+        filters = [f"crop={':'.join(map(str, geometry))}", "setsar=1", f"format={intermediate}"]
+        filters += {0: [], 1: ["transpose=clock"], 2: ["hflip", "vflip"],
+                    3: ["transpose=cclock"]}[turns]
+        graph.append(f"[{min(i, len(paths)-1)}:{stream['index']}]{','.join(filters)}[l{i}]")
+    order = "[l1][l0]" if args.swap else "[l0][l1]"
+    motion = "sendcmd=f=motion.cmd," if args.motion else ""
+    cadence = f",fps={args.fps}" if args.fps else ""
+    rng = color(left, "color_range")
+    range_filter = f",scale=in_range={rng}:out_range={rng}" if rng in {"pc", "tv"} else ""
+    graph.append(f"{order}hstack=shortest=1,{motion}v360@stitch=dfisheye:equirect:"
+                 f"w={w}:h={h}:ih_fov={args.fov}:iv_fov={args.fov}:interp={args.interp}"
+                 f"{cadence}{range_filter},format={target}[sphere]")
+    cmd = []
+    for path in paths:
+        cmd += ["-noautorotate", "-i", str(path)]
+    cmd += ["-filter_complex", ";".join(graph), "-map", "[sphere]", "-map", "0:a:0?",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-c:a", "copy",
+            "-fps_mode", "passthrough", *enc]
+    if args.seconds is not None:
+        if not math.isfinite(args.seconds) or args.seconds <= 0:
+            raise ValueError("Preview duration must be positive")
+        cmd += ["-t", str(args.seconds)]
+    for field, flag in COLOR_FIELDS.items():
+        value = color(left, field)
+        if value and value not in {"unknown", "unspecified", "reserved"}:
+            cmd += [f"-{flag}", value]
+    encode(ffmpeg, ffprobe, cmd, Path(args.output), bits, w, h, args.motion)
+
+
+def size(value):
+    w, h = map(int, value.lower().split("x"))
+    return w, h
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--ffprobe", default="ffprobe")
+    parser.add_argument("--require-arm64", action="store_true")
+    sub = parser.add_subparsers(dest="action", required=True)
+    inspect = sub.add_parser("inspect")
+    inspect.add_argument("input")
+    sub.add_parser("doctor")
+    convert_parser = sub.add_parser("convert")
+    convert_parser.add_argument("input")
+    convert_parser.add_argument("output")
+    convert_parser.add_argument("--right")
+    for lens in ("left", "right"):
+        convert_parser.add_argument(f"--{lens}-stream", type=int)
+        convert_parser.add_argument(f"--{lens}-crop")
+        convert_parser.add_argument(f"--{lens}-turns", type=int, choices=range(4), default=0)
+    convert_parser.add_argument("--swap", action="store_true")
+    convert_parser.add_argument("--fov", type=float, default=180)
+    convert_parser.add_argument("--interp", choices=("near", "line", "cube"), default="line")
+    convert_parser.add_argument("--fps", type=lambda x: str(rate(x)))
+    convert_parser.add_argument("--motion", type=Path)
+    convert_parser.add_argument("--seconds", type=float, help="Limit output to a short preview")
+    for command in (convert_parser, sub.add_parser("encode-test")):
+        command.add_argument("--size", type=size)
+        command.add_argument("--bits", type=int, choices=(8, 10))
+        command.add_argument("--encoder", choices=("x265", "mf"), default="x265")
+        command.add_argument("--bitrate")
+        command.add_argument("--crf", type=int, choices=range(52), default=18)
+        command.add_argument("--preset", choices=("ultrafast", "superfast", "veryfast", "faster",
+                                                  "fast", "medium", "slow", "slower", "veryslow",
+                                                  "placebo"), default="fast")
+    test = sub.choices["encode-test"]
+    test.add_argument("output")
+    test.add_argument("--fps", type=lambda x: str(rate(x)), default="30")
+    test.add_argument("--seconds", type=float, default=2)
+    args = parser.parse_args()
+    try:
+        ffprobe = executable(args.ffprobe)
+        if args.action == "inspect" and not args.require_arm64:
+            print(json.dumps(probe(ffprobe, Path(args.input).resolve(strict=True)), indent=2))
+            return
+        ffmpeg = executable(args.ffmpeg)
+        if args.require_arm64 and any(machine(e) != "ARM64" for e in (ffmpeg, ffprobe)):
+            raise ValueError("Both FFmpeg tools must be Windows ARM64 PE executables")
+        if args.action == "inspect":
+            print(json.dumps(probe(ffprobe, Path(args.input).resolve(strict=True)), indent=2))
+        elif args.action == "doctor":
+            print(json.dumps({"host": platform.machine(), "python": platform.architecture()[0],
+                              "ffmpeg": machine(ffmpeg), "ffprobe": machine(ffprobe)}, indent=2))
+            run([ffmpeg, "-version"])
+            run([ffmpeg, "-hide_banner", "-h", "encoder=hevc_mf"])
+        elif args.action == "encode-test":
+            w, h = args.size or (1920, 960)
+            bits = args.bits or 8
+            if w != 2*h or h < 2 or h % 2 or not 0 < args.seconds <= 300:
+                raise ValueError("Test requires even 2:1 dimensions and 0 < seconds <= 300")
+            enc = encoder_args(args.encoder, bits, args.bitrate, args.crf, args.preset)
+            fmt = "nv12" if args.encoder == "mf" else ("yuv420p10le" if bits == 10 else "yuv420p")
+            encode(ffmpeg, ffprobe, ["-f", "lavfi", "-i",
+                   f"testsrc2=size={w}x{h}:rate={args.fps},format={fmt}", "-t", str(args.seconds),
+                   *enc], Path(args.output), bits, w, h)
+        else:
+            convert(args, ffmpeg, ffprobe)
+    except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError, struct.error,
+            subprocess.CalledProcessError) as error:
+        parser.exit(1, f"Error: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
