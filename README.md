@@ -2,6 +2,10 @@
 
 Experimental desktop and command-line converter for two synchronized, square-cropped fisheye views, built for Windows on Arm with a portable Linux path. It produces a mono 2:1 equirectangular HEVC MP4 with Spherical Video V2 metadata. It supports factory-calibrated X6 projection, overlap blending and automatic rotational stabilization using the camera's motion data.
 
+The project aims to make full use of the **Qualcomm Snapdragon X2 Elite X2E-88-100**, tested on the ASUS Zenbook A14. The native Windows pipeline uses the dedicated video processing unit (VPU) through Media Foundation for hardware video decoding and 8-bit HEVC encoding. The **Adreno X2-90 GPU** handles Direct3D stitching, seam blending and stabilization. The optional 10-bit path takes advantage of the platform's shared memory controller and cache-coherent unified memory. Direct3D 12 writes the stitched frame into CPU-readable memory so x265 can accept it without an intermediate GPU readback copy. [Qualcomm platform specifications](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/documents/Snapdragon-X2-Elite-Product-Brief.pdf)
+
+See [native Direct3D exports](docs/native-d3d11.md) for supported modes and [benchmarks](docs/benchmark.md) for the measured results.
+
 ## Windows setup
 
 Use native ARM64 Python 3.11 or later and put matching ARM64 `ffmpeg.exe` and `ffprobe.exe` on PATH. The current BtbN Windows ARM64 GPL build provides a starting point for libx265. Pin and record the exact build for repeatable runs. [FFmpeg downloads](https://ffmpeg.org/download.html) · [BtbN releases](https://github.com/BtbN/FFmpeg-Builds/releases)
