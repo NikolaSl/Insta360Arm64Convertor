@@ -10,19 +10,23 @@ def camera_indices(rig):
     return [rig["pictures"][c["picture"]["input"]]["VideoTrack"] for c in cameras]
 
 
-def camera_maps(camera, ray, width, height, np):
-    intrinsics = camera["intrinsics"]
-    model = intrinsics["model"]["Mei"]
-    d = model["dist"]["RadtanPro"]["d"]
+def camera_matrix(camera):
     rotation = camera["rotation"]
     w, x, y, z = (rotation[k] for k in "wxyz")
     # The rig stores camera-to-rig. Project by applying its inverse.
-    matrix = (
+    return (
         (1 - 2*(y*y + z*z), 2*(x*y + z*w), 2*(x*z - y*w)),
         (2*(x*y - z*w), 1 - 2*(x*x + z*z), 2*(y*z + x*w)),
         (2*(x*z + y*w), 2*(y*z - x*w), 1 - 2*(x*x + y*y)),
     )
-    a, b, c = (sum(component * weight for component, weight in zip(ray, row)) for row in matrix)
+
+
+def camera_maps(camera, ray, width, height, np):
+    intrinsics = camera["intrinsics"]
+    model = intrinsics["model"]["Mei"]
+    d = model["dist"]["RadtanPro"]["d"]
+    a, b, c = (sum(component * weight for component, weight in zip(ray, row))
+               for row in camera_matrix(camera))
     denom = c + model["xi"]
     with np.errstate(divide="ignore", invalid="ignore"):
         mx, my = a / denom, b / denom
@@ -45,11 +49,7 @@ def camera_maps(camera, ray, width, height, np):
     return np.where(valid, px, 65535), np.where(valid, py, 65535), weight
 
 
-def prepare_maps(folder, rig, streams, width, height, bits):
-    try:
-        import numpy as np
-    except ImportError as error:
-        raise ValueError("Calibrated stitching requires NumPy in this Python installation") from error
+def validate_rig(rig, streams):
     projection = rig["projection"]
     cameras = projection["kind"]["Rig"]["cameras"]
     if (len(cameras) != 2 or projection["stereo"]["layout"] != "Mono" or
@@ -60,6 +60,15 @@ def prepare_maps(folder, rig, streams, width, height, bits):
     indices = camera_indices(rig)
     if set(indices) != {s["index"] for s in streams}:
         raise ValueError("Factory calibration does not match the selected tracks")
+    return cameras, indices
+
+
+def prepare_maps(folder, rig, streams, width, height, bits):
+    try:
+        import numpy as np
+    except ImportError as error:
+        raise ValueError("Calibrated stitching requires NumPy in this Python installation") from error
+    cameras, indices = validate_rig(rig, streams)
     by_index = {s["index"]: s for s in streams}
     if max(width, height, *(s["width"] for s in streams), *(s["height"] for s in streams)) >= 65535:
         raise ValueError("Calibration maps require dimensions below 65535")

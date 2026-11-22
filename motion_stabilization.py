@@ -67,7 +67,7 @@ def v360_angles(q):
     return tuple(map(math.degrees, (yaw, pitch, roll)))
 
 
-def estimate_rotations(samples, lens_to_rig, fps, last_frame, offset_ms=0):
+def estimate_quaternions(samples, lens_to_rig, fps, last_frame, offset_ms=0):
     """Yield frame-indexed rotations. Positive offset samples the IMU later."""
     step_ms = 1000 / float(fps)
     start = offset_ms
@@ -115,10 +115,15 @@ def estimate_rotations(samples, lens_to_rig, fps, last_frame, offset_ms=0):
                 heading = math.remainder(heading - math.expm1(-dt/0.45)*error, 2*math.pi)
         if timestamp >= start + frame*step_ms:
             output_to_camera = product(inverse(attitude), scaled_axis((0, 1, 0), heading or 0))
-            yield frame, v360_angles(output_to_camera)
+            yield frame, output_to_camera
             if frame == last_frame:
                 return
             frame += 1
             if timestamp >= start + frame*step_ms:
                 raise ValueError("X6 IMU cannot cover every video frame")
     raise ValueError("X6 IMU ends before the last requested frame")
+
+
+def estimate_rotations(samples, lens_to_rig, fps, last_frame, offset_ms=0):
+    for frame, orientation in estimate_quaternions(samples, lens_to_rig, fps, last_frame, offset_ms):
+        yield frame, v360_angles(orientation)

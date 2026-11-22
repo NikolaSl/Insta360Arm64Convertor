@@ -6,13 +6,31 @@ import sys
 import tempfile
 import unittest
 
-from insta360_arm import box, boxes, corrections, encoder_args, probe, videos
+from insta360_arm import automatic_hardware_bitrate, box, boxes, corrections, encoder_args, machine, probe, videos
 
 
 class UnitTests(unittest.TestCase):
+    def test_elf_architecture_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "native-tool"
+            for machine_code, expected in ((183, "ARM64"), (62, "x64")):
+                for order, tag in (("little", 1), ("big", 2)):
+                    path.write_bytes(b"\x7fELF" + bytes((2, tag)) + bytes(12)
+                                     + machine_code.to_bytes(2, order))
+                    self.assertEqual(machine(path), expected)
+
     def test_mf_rejects_ten_bit(self):
         with self.assertRaisesRegex(ValueError, "8-bit"):
             encoder_args("mf", 10, "25M", 18, "fast")
+
+    def test_automatic_bitrate_uses_output_size_and_cadence(self):
+        self.assertEqual(automatic_hardware_bitrate(7680, 3840, 30), "120M")
+        self.assertEqual(automatic_hardware_bitrate(6016, 3008, 30), "60M")
+        self.assertEqual(automatic_hardware_bitrate(5760, 2880, 30), "60M")
+        self.assertEqual(automatic_hardware_bitrate(5760, 2880, 60), "120M")
+        self.assertEqual(automatic_hardware_bitrate(3840, 1920, 60), "70M")
+        self.assertEqual(encoder_args("x265", 10, None, 18, "faster")[-2:], ["-crf", "18"])
+        self.assertEqual(encoder_args("x265", 10, "40M", 18, "faster")[-2:], ["-b:v", "40M"])
 
     def test_boxes(self):
         self.assertEqual(list(boxes(box(b"abcd", b"abc"))), [(b"abcd", b"abc")])
@@ -24,7 +42,9 @@ class UnitTests(unittest.TestCase):
             path = Path(temp) / "motion.csv"
             header = "time_s,yaw_deg,pitch_deg,roll_deg\n"
             path.write_text(header + "0,20,0,0\n1,0,0,0\n")
-            self.assertIn("v360@stitch reset_rot -1, v360@stitch yaw 20", corrections(path))
+            command = corrections(path)
+            self.assertIn("0.000000000-1.000000000 v360@stitch reset_rot -1", command)
+            self.assertIn("v360@stitch reset_rot -1, v360@stitch yaw 20", command)
             path.write_text(header + "0,0,0,0\n0,0,0,0\n")
             with self.assertRaises(ValueError):
                 corrections(path)
